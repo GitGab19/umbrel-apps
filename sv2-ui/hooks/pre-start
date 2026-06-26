@@ -7,6 +7,55 @@ APP_DATA_DIR="${APP_DIR}/data"
 DOCKER_DIR="${APP_DATA_DIR}/docker"
 ENTRYPOINT_FILE="${APP_DIR}/entrypoint.sh"
 
+insert_entrypoint_firewall_patch() {
+    local entrypoint_file="${1}"
+    local patch_file
+    local tmp_file
+
+    if [[ ! -f "${entrypoint_file}" ]] || grep -q "configure_bridge_forwarding" "${entrypoint_file}"
+    then
+        return
+    fi
+
+    patch_file="$(mktemp)"
+    tmp_file="$(mktemp)"
+
+    cat > "${patch_file}" <<'PATCH'
+configure_bridge_forwarding() {
+    local bridge="${1}"
+    local subnet="${2}"
+
+    # dockerd runs with --iptables=false so the nested Docker daemon cannot
+    # rewrite Umbrel's host Docker chains. Add only the scoped forwarding/NAT
+    # rules needed by sv2-ui's nested Translator/JDC containers.
+    iptables -C FORWARD -i "${bridge}" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "${bridge}" -j ACCEPT
+    iptables -C FORWARD -o "${bridge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "${bridge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -t nat -C POSTROUTING -s "${subnet}" ! -o "${bridge}" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "${subnet}" ! -o "${bridge}" -j MASQUERADE
+}
+PATCH
+
+    awk -v patch_file="${patch_file}" '
+        /^DOCKER_SOCKET="/ && inserted == 0 {
+            while ((getline line < patch_file) > 0) {
+                print line
+            }
+            close(patch_file)
+            print ""
+            inserted = 1
+        }
+        /ensure_bridge_exists "\$\{bridge\}" "\$\{ip_range\}"/ && called == 0 {
+            print
+            print "    configure_bridge_forwarding \"${bridge}\" \"${ip_range}\""
+            called = 1
+            next
+        }
+        { print }
+    ' "${entrypoint_file}" > "${tmp_file}"
+
+    cat "${tmp_file}" > "${entrypoint_file}"
+    rm -f "${patch_file}" "${tmp_file}"
+}
+
 # entrypoint.sh is mounted from app data but is not copied into existing installs
 # during app updates, so migrate the v0.1.0 timeout in place.
 if [[ -f "${ENTRYPOINT_FILE}" ]] && grep -q 'for i in $(seq 1 30); do' "${ENTRYPOINT_FILE}"
@@ -20,6 +69,8 @@ DOCKER_READY_TIMEOUT_SECONDS=180' \
         "${ENTRYPOINT_FILE}"
     rm -f "${ENTRYPOINT_FILE}.bak"
 fi
+
+insert_entrypoint_firewall_patch "${ENTRYPOINT_FILE}"
 
 # Remove stale Docker-in-Docker runtime state that can survive power loss,
 # crashes, restarts, or updates and prevent the nested Docker daemon from

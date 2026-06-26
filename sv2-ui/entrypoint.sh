@@ -68,11 +68,24 @@ stop_dockerd() {
     fi
 }
 
+configure_bridge_forwarding() {
+    local bridge="${1}"
+    local subnet="${2}"
+
+    # dockerd runs with --iptables=false so the nested Docker daemon cannot
+    # rewrite Umbrel's host Docker chains. Add only the scoped forwarding/NAT
+    # rules needed by sv2-ui's nested Translator/JDC containers.
+    iptables -C FORWARD -i "${bridge}" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "${bridge}" -j ACCEPT
+    iptables -C FORWARD -o "${bridge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "${bridge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -t nat -C POSTROUTING -s "${subnet}" ! -o "${bridge}" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "${subnet}" ! -o "${bridge}" -j MASQUERADE
+}
+
 if [[ "${DOCKER_ENSURE_BRIDGE}" != "" ]]
 then
     bridge="${DOCKER_ENSURE_BRIDGE%%:*}"
     ip_range="${DOCKER_ENSURE_BRIDGE#*:}"
     ensure_bridge_exists "${bridge}" "${ip_range}"
+    configure_bridge_forwarding "${bridge}" "${ip_range}"
 fi
 
 DOCKER_SOCKET="/data/docker.sock"
